@@ -1,0 +1,660 @@
+// ===== BLOCO A: UTILITÁRIOS E PERSISTÊNCIA =================================================
+
+const SHEET_ID = "************";
+const SHEET_NAME = "plataforma_usuarios";
+const SHEET_NAME_DEACTIVATED = "plataforma_usuarios_desativados";
+const TZ = "America/Sao_Paulo";
+
+function criarChave(prefix, usuarioId, token, millis) {
+  return `${prefix}_${usuarioId}_${token}_${millis}`;
+}
+
+function buscarChaves(prefix, usuarioId, token = "") {
+  const props = PropertiesService.getScriptProperties();
+  const allKeys = props.getKeys();
+  return allKeys
+    .filter(k =>
+      k.startsWith(prefix + '_') &&
+      k.includes('_' + usuarioId + '_') &&
+      (token ? k.includes('_' + token + '_') : true)
+    )
+    .map(k => ({ chave: k, valor: props.getProperty(k) }));
+}
+
+function getLastPing(usuarioId, token) {
+  const all = buscarChaves("Ping", usuarioId, token);
+  if (!all.length) return null;
+  all.sort((a, b) => JSON.parse(b.valor).current_millis - JSON.parse(a.valor).current_millis);
+  return JSON.parse(all[0].valor);
+}
+function getLastLogin(usuarioId, token) {
+  const all = buscarChaves("Login", usuarioId, token);
+  if (!all.length) return null;
+  all.sort((a, b) => JSON.parse(b.valor).start_millis - JSON.parse(a.valor).start_millis);
+  return JSON.parse(all[0].valor);
+}
+function hasLogout(usuarioId, token) {
+  const logouts = buscarChaves("Logout", usuarioId, token);
+  return logouts.length > 0;
+}
+
+function compararFingerprints(fp1, fp2) {
+  if (!fp1 || !fp2) return Object.keys(fp1 || {}).concat(Object.keys(fp2 || {}));
+  const diffs = [];
+  for (let key in fp1) {
+    if (fp1[key] !== fp2[key]) diffs.push(key);
+  }
+  for (let key in fp2) {
+    if (!(key in fp1)) diffs.push(key);
+  }
+  return diffs;
+}
+
+function validarToken(usuarioId, token) {
+  if (!usuarioId || !token) throw new Error("Token ou usuário ausente.");
+  var uuidV4Regex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (typeof token !== "string" || !uuidV4Regex.test(token))
+    throw new Error("Token inválido: formato não reconhecido (esperado UUID v4).");
+  var logins = buscarChaves("Login", usuarioId, token);
+  if (!logins.length) throw new Error("Token não encontrado ou usuário não autenticado.");
+  if (hasLogout(usuarioId, token)) throw new Error("Token expirado.");
+}
+
+function criarLogin(usuarioId, token, origin, sessionId, fingerprint) {
+  const millis = Date.now();
+  const obj = {
+    usuarioId,
+    start_millis: millis,
+    end_millis: millis,
+    duration_millis: null,
+    origin,
+    sessionId,
+    fingerprint
+  };
+  const key = criarChave("Login", usuarioId, token, millis);
+  setPropertyAndCheck(key, JSON.stringify(obj));
+}
+
+function criarPing(usuarioId, token, origin, sessionId, fingerprint) {
+  validarToken(usuarioId, token);
+  const millis = Date.now();
+  const obj = {
+    usuarioId,
+    start_millis: millis,
+    current_millis: millis,
+    end_millis: millis,
+    duration_millis: null,
+    origin,
+    sessionId,
+    fingerprint
+  };
+  const key = criarChave("Ping", usuarioId, token, millis);
+  setPropertyAndCheck(key, JSON.stringify(obj));
+  return { key, obj };
+}
+
+function atualizarPing(usuarioId, token, origin, sessionId, fingerprint) {
+  validarToken(usuarioId, token);
+
+  const allPings = buscarChaves("Ping", usuarioId, token);
+  if (!allPings.length) {
+    // Se não existe ping, cria!
+    criarPing(usuarioId, token, origin, sessionId, fingerprint);
+    Logger.log("DEBUG: Nenhum Ping_ encontrado. Criando novo Ping_.");
+    return true;
+  }
+  allPings.sort((a, b) => JSON.parse(b.valor).current_millis - JSON.parse(a.valor).current_millis);
+  const { chave, valor } = allPings[0];
+  let obj;
+  try { obj = JSON.parse(valor); } catch(e) { return false; }
+
+  // 3. Bloqueio por sessionId ou fingerprint divergentes
+  const sessionIdDiff = obj.sessionId && obj.sessionId !== sessionId;
+  const camposDiferentes = compararFingerprints(obj.fingerprint, fingerprint);
+  const fingerprintDiff = camposDiferentes.length > 0;
+
+  if (sessionIdDiff || fingerprintDiff) {
+    let motivo = sessionIdDiff && fingerprintDiff ? "sessionId_e_fingerprint_diferente" :
+                (sessionIdDiff ? "sessionId_diferente" : "fingerprint_diferente");
+    criarLogout({
+      usuarioId, token, origin,
+      motivo: motivo,
+      sessionIdAtual: obj.sessionId,
+      sessionIdNovo: sessionId,
+      fingerprintAtual: obj.fingerprint,
+      fingerprintNovo: fingerprint,
+      camposFingerprintDif: camposDiferentes
+    });
+    return false;
+  }
+
+  // 4. Atualiza o Ping (só se passou por todas as validações)
+  obj.last_millis = obj.current_millis || Date.now();
+  obj.current_millis = Date.now();
+  obj.end_millis = obj.current_millis;
+  obj.duration_millis = obj.current_millis - obj.start_millis;
+  obj.origin = origin;
+  obj.sessionId = sessionId;
+  obj.fingerprint = fingerprint;
+
+  setPropertyAndCheck(chave, JSON.stringify(obj));
+  Logger.log("DEBUG: Ping atualizado! Dados: %s", JSON.stringify(obj));
+  return true;
+}
+
+function criarLogout(params) {
+  if (!params.usuarioId || !params.token) return;
+
+  const props = PropertiesService.getScriptProperties();
+  const agora = Date.now();
+
+  // Recupera ultimo ping para extrair dados se faltarem em params
+  let lastPing = null;
+  const allPings = buscarChaves("Ping", params.usuarioId, params.token);
+  if (allPings.length) {
+    allPings.sort((a, b) => b.chave.localeCompare(a.chave));
+    try { lastPing = JSON.parse(allPings[0].valor); } catch (e) {}
+  }
+
+  // Recupera login se necessário
+  let login = null;
+  const allLogins = buscarChaves("Login", params.usuarioId, params.token);
+  if (allLogins.length) {
+    allLogins.sort((a, b) => b.chave.localeCompare(a.chave));
+    try { login = JSON.parse(allLogins[0].valor); } catch (e) {}
+  }
+
+  // Coleta millis padronizado
+  const initial_millis = params.initial_millis
+    || (login ? login.start_millis : null)
+    || (lastPing ? lastPing.start_millis : null)
+    || null;
+
+  const previous_millis = params.previous_millis
+    || (lastPing ? lastPing.last_millis : null)
+    || null;
+
+  const current_millis = params.current_millis
+    || (lastPing ? lastPing.current_millis : null)
+    || null;
+
+  const final_millis = params.final_millis
+    || params.end_millis
+    || agora;
+
+  const elapsed_millis = (initial_millis && final_millis) ? (final_millis - initial_millis) : null;
+
+  // Compose objeto padronizado
+  const logoutObj = {
+    usuarioId: params.usuarioId,
+    token: params.token,
+    origin: params.origin || (lastPing ? lastPing.origin : (login ? login.origin : "desconhecido")),
+    reason: params.reason || params.motivo || "logout",
+    current_sessionId: params.current_sessionId || params.sessionIdAtual || (lastPing ? lastPing.sessionId : (login ? login.sessionId : null)),
+    new_sessionId: params.new_sessionId || params.sessionIdNovo || null,
+    current_fingerprint: params.current_fingerprint || params.fingerprintAtual || (lastPing ? lastPing.fingerprint : (login ? login.fingerprint : null)),
+    new_fingerprint: params.new_fingerprint || params.fingerprintNovo || null,
+    difference_fingerprint: params.difference_fingerprint || params.camposFingerprintDif || [],
+    difference_sessionId: params.difference_sessionId || null,
+    initial_millis: initial_millis,
+    previous_millis: previous_millis,
+    current_millis: current_millis,
+    final_millis: final_millis,
+    elapsed_millis: elapsed_millis,
+    max_allowed_ping: params.max_allowed_ping || (typeof SESSION_RULES !== "undefined" ? SESSION_RULES.PING_INTERVAL_MAX_MILLIS : null),
+    min_allowed_ping: params.min_allowed_ping || (typeof SESSION_RULES !== "undefined" ? SESSION_RULES.PING_INTERVAL_MIN_MILLIS : null),
+    others: params.others || params.outros || null,
+  };
+
+  // Salva no Properties
+  const key = criarChave("Logout", params.usuarioId, params.token, agora);
+  setPropertyAndCheck(key, JSON.stringify(logoutObj));
+
+  // Remove Login_ e Ping_ para esse usuário/token
+  allLogins.forEach(({ chave }) => props.deleteProperty(chave));
+  allPings.forEach(({ chave }) => props.deleteProperty(chave));
+
+  Logger.log("criarLogout: Logout salvo e chaves removidas para usuarioId=%s, token=%s", params.usuarioId, params.token);
+}
+
+function enviarAction(usuarioId, token, origin, action) {
+  const millis = Date.now();
+  const obj = {
+    // millis,
+    action,
+    // end_millis: Date.now(),
+    origin,
+    // fingerprint
+  };
+  const key = criarChave("Action", usuarioId, token, millis);
+  AppLogger.logAction(CacheService.getScriptCache(), key, JSON.stringify(obj), 21600); // 6h
+}
+
+// ===== BLOCO B: REGRAS DE SESSÃO, EXPIRAÇÃO E CONTROLE =================================================
+
+const SESSION_RULES = {
+  MAX_SESSION_MILLIS:            1 * 60 * 60 * 1000,       // 1 hora para exemplo
+  PING_NO_UPDATE_MILLIS:         1 * 1 * 60 * 1000,        // 60 segundos sem atualizar ping (Logout automático)
+  PING_NO_INITIAL_MILLIS:        1 * 1 * 60 * 1000,        // 60 segundos sem ping após login
+
+  PING_INTERVAL_MIN_MILLIS:      1 * 1 * 9 * 1000,         // 9 segundos mínimo entre pings 
+  PING_INTERVAL_MAX_MILLIS:      1 * 1 * 50 * 1000         // 50 segundos máximo entre pings 
+};
+
+function invalidarTokensAntigos(usuarioId, tokenAtual, reason) {
+  const allLogins = buscarChaves("Login", usuarioId);
+  const nowMillis = Date.now();
+  allLogins.forEach(({ chave, valor }) => {
+    const partes = chave.split('_');
+    const tokenAntigo = partes[2];
+    if (tokenAntigo !== tokenAtual) {
+      let obj = {};
+      try { obj = JSON.parse(valor); } catch(e) {}
+      criarLogout({
+        usuarioId: usuarioId,
+        token: tokenAntigo,
+        origin: obj.origin || "login",
+        reason: reason || "novo_login",
+        current_sessionId: obj.sessionId || null,
+        current_fingerprint: obj.fingerprint || null,
+        initial_millis: obj.start_millis || null,
+        final_millis: nowMillis
+      });
+    }
+  });
+}
+
+function registrarExpired(usuarioId, token, origin, sessionId, fingerprint) {
+  // Só registra Expired se já houver Logout registrado para este token
+  if (!hasLogout(usuarioId, token)) return;
+  const tentativas = buscarChaves("Expired", usuarioId, token);
+  if (tentativas.length < 10) {
+    const nowMillis = Date.now();
+    const obj = {
+      usuarioId,
+      token,
+      origin,
+      sessionId: sessionId || null,
+      fingerprint: fingerprint || null,
+      reason: "tentativa_uso_token_expirado",
+      final_millis: nowMillis
+    };
+    const key = criarChave("Expired", usuarioId, token, nowMillis);
+    setPropertyAndCheck(key, JSON.stringify(obj));
+  }
+}
+
+// === FLUXO CENTRAL DE PROCESSAMENTO DE SESSÃO PADRONIZADO ===
+
+function auditoriaReativa(usuarioId, token, origin, sessionId, fingerprint) {
+  if (!token || token === "undefined") return { expired: true };
+
+  // 1. Já expirado?
+  if (hasLogout(usuarioId, token)) {
+    registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+    return { expired: true };
+  }
+
+  // 2. Tempo máximo da sessão
+  const login = getLastLogin(usuarioId, token);
+  if (login) {
+    const agora = Date.now();
+    if (SESSION_RULES.MAX_SESSION_MILLIS && (agora - login.start_millis > SESSION_RULES.MAX_SESSION_MILLIS)) {
+      criarLogout({
+        usuarioId,
+        token,
+        origin: login.origin,
+        reason: "tempo_maximo_atingido_por_sessao",
+        current_sessionId: login.sessionId,
+        current_fingerprint: login.fingerprint,
+        initial_millis: login.start_millis,
+        final_millis: login.start_millis + SESSION_RULES.MAX_SESSION_MILLIS,
+        elapsed_millis: SESSION_RULES.MAX_SESSION_MILLIS
+      });
+      registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+      return { expired: true };
+    }
+  }
+
+  // 3. Sessão sem ping criado em até 'x' millis após login
+  if (login) {
+    const agora = Date.now();
+    const pings = buscarChaves("Ping", usuarioId, token);
+    if (pings.length === 0 && (agora - login.start_millis > SESSION_RULES.PING_NO_INITIAL_MILLIS)) {
+      criarLogout({
+        usuarioId,
+        token,
+        origin: login.origin,
+        reason: "login_sem_ping_por_" + (SESSION_RULES.PING_NO_INITIAL_MILLIS/1000) + "s",
+        current_sessionId: login.sessionId,
+        current_fingerprint: login.fingerprint,
+        initial_millis: login.start_millis,
+        final_millis: agora,
+        elapsed_millis: agora - login.start_millis
+      });
+      registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+      return { expired: true };
+    }
+  }
+
+  // 4. Ping não atualizado no tempo de tolerância
+  const lastPing = getLastPing(usuarioId, token);
+  if (lastPing) {
+    const agora = Date.now();
+    if (agora - lastPing.current_millis > SESSION_RULES.PING_NO_UPDATE_MILLIS) {
+      criarLogout({
+        usuarioId,
+        token,
+        origin: lastPing.origin,
+        reason: "ping_nao_atualizado_em_" + (SESSION_RULES.PING_NO_UPDATE_MILLIS/1000) + "s",
+        current_sessionId: lastPing.sessionId,
+        current_fingerprint: lastPing.fingerprint,
+        initial_millis: lastPing.start_millis,
+        previous_millis: lastPing.last_millis || null,
+        current_millis: lastPing.current_millis,
+        final_millis: agora,
+        elapsed_millis: agora - lastPing.start_millis,
+        max_allowed_ping: SESSION_RULES.PING_INTERVAL_MAX_MILLIS,
+        min_allowed_ping: SESSION_RULES.PING_INTERVAL_MIN_MILLIS,
+        others: {
+          difference_millis: agora - lastPing.current_millis,
+          tolerance_millis: SESSION_RULES.PING_NO_UPDATE_MILLIS
+        }
+      });
+      registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+      return { expired: true };
+    }
+  }
+
+  // 5. Atualizar ping, rejeita divergência de sessionId/fingerprint
+  if (!atualizarPing(usuarioId, token, origin, sessionId, fingerprint)) {
+    registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+    return { expired: true };
+  }
+
+  // 6. Ping em intervalo irregular
+  if (
+    lastPing &&
+    typeof lastPing.last_millis === "number" &&
+    typeof lastPing.current_millis === "number"
+  ) {
+    const diff = lastPing.current_millis - lastPing.last_millis;
+    if (diff < SESSION_RULES.PING_INTERVAL_MIN_MILLIS || diff > SESSION_RULES.PING_INTERVAL_MAX_MILLIS) {
+      criarLogout({
+        usuarioId: lastPing.usuarioId,
+        token: lastPing.token,
+        origin: lastPing.origin,
+        reason: "ping_intervalo_irregular_de_" + (diff / 1000) + "s",
+        current_sessionId: lastPing.sessionId,
+        current_fingerprint: lastPing.fingerprint,
+        initial_millis: lastPing.start_millis,
+        previous_millis: lastPing.last_millis,
+        current_millis: lastPing.current_millis,
+        final_millis: Date.now(),
+        elapsed_millis: lastPing.current_millis - lastPing.start_millis,
+        min_allowed_ping: SESSION_RULES.PING_INTERVAL_MIN_MILLIS,
+        max_allowed_ping: SESSION_RULES.PING_INTERVAL_MAX_MILLIS,
+        others: {
+          difference_millis: diff
+        }
+      });
+      registrarExpired(usuarioId, token, origin, sessionId, fingerprint);
+      return { expired: true };
+    }
+  }
+
+  // Tudo certo!
+  return { expired: false };
+}
+
+// Auditoria ativa pelo trigger do Apps Script
+function auditoriaAtiva() {
+  const props = PropertiesService.getScriptProperties();
+  const allKeys = props.getKeys();
+  const logins = allKeys.filter(k => k.startsWith("Login_"));
+  const agora = Date.now();
+
+  Logger.log("auditoriaAtiva: INICIANDO com %d Login_ ativos...", logins.length);
+
+  logins.forEach(loginKey => {
+    const partes = loginKey.split('_');
+    if (partes.length < 4) return;
+    const usuarioId = partes[1];
+    const token = partes[2];
+
+    // 1. Já expirado? (já tem Logout_)
+    const logoutKeys = allKeys.filter(k => k.startsWith(`Logout_${usuarioId}_${token}_`));
+    if (logoutKeys.length > 0) return;
+
+    // 2. Pega objeto do login
+    let login = {};
+    try { login = JSON.parse(props.getProperty(loginKey)); } catch(e) {}
+    if (!login || !login.start_millis) return;
+
+    // 3. Tempo máximo de sessão
+    if (SESSION_RULES.MAX_SESSION_MILLIS && (agora - login.start_millis > SESSION_RULES.MAX_SESSION_MILLIS)) {
+      criarLogout({
+        usuarioId, token,
+        origin: login.origin,
+        reason: "tempo_maximo_atingido_por_sessao",
+        current_sessionId: login.sessionId,
+        current_fingerprint: login.fingerprint,
+        initial_millis: login.start_millis,
+        final_millis: login.start_millis + SESSION_RULES.MAX_SESSION_MILLIS,
+        elapsed_millis: SESSION_RULES.MAX_SESSION_MILLIS
+      });
+      Logger.log("auditoriaAtiva: Expirou por tempo máximo. usuarioId=%s, token=%s", usuarioId, token);
+      return;
+    }
+
+    // 4. Sessão sem ping criado em até x millis após login
+    const pingKeys = allKeys.filter(k => k.startsWith(`Ping_${usuarioId}_${token}_`));
+    if (pingKeys.length === 0 && (agora - login.start_millis > SESSION_RULES.PING_NO_INITIAL_MILLIS)) {
+      criarLogout({
+        usuarioId, token,
+        origin: login.origin,
+        reason: "login_sem_ping_por_" + (SESSION_RULES.PING_NO_INITIAL_MILLIS/1000) + "s",
+        current_sessionId: login.sessionId,
+        current_fingerprint: login.fingerprint,
+        initial_millis: login.start_millis,
+        final_millis: agora,
+        elapsed_millis: agora - login.start_millis
+      });
+      Logger.log("auditoriaAtiva: Expirou por ausência de Ping_. usuarioId=%s, token=%s", usuarioId, token);
+      return;
+    }
+
+    // 5. Ping mais recente
+    let lastPing = null;
+    if (pingKeys.length > 0) {
+      lastPing = pingKeys
+        .map(k => ({ k, v: props.getProperty(k) }))
+        .map(obj => {
+          let o = {};
+          try { o = JSON.parse(obj.v); } catch(e) {}
+          o.__key = obj.k;
+          return o;
+        })
+        .filter(o => o.current_millis)
+        .sort((a, b) => b.current_millis - a.current_millis)[0];
+
+      if (lastPing) {
+        lastPing.usuarioId = usuarioId;
+        lastPing.token = token;
+      }
+    }
+
+    // 6. Ping não atualizado no tempo de tolerância
+    if (lastPing && (agora - lastPing.current_millis > SESSION_RULES.PING_NO_UPDATE_MILLIS)) {
+      criarLogout({
+        usuarioId: lastPing.usuarioId,
+        token: lastPing.token,
+        origin: lastPing.origin,
+        reason: "ping_nao_atualizado_em_" + (SESSION_RULES.PING_NO_UPDATE_MILLIS/1000) + "s",
+        current_sessionId: lastPing.sessionId,
+        current_fingerprint: lastPing.fingerprint,
+        initial_millis: lastPing.start_millis,
+        previous_millis: lastPing.last_millis || null,
+        current_millis: lastPing.current_millis,
+        final_millis: agora,
+        elapsed_millis: agora - lastPing.start_millis,
+        max_allowed_ping: SESSION_RULES.PING_INTERVAL_MAX_MILLIS,
+        min_allowed_ping: SESSION_RULES.PING_INTERVAL_MIN_MILLIS,
+        others: {
+          difference_millis: agora - lastPing.current_millis,
+          tolerance_millis: SESSION_RULES.PING_NO_UPDATE_MILLIS
+        }
+      });
+      Logger.log("auditoriaAtiva: Expirou por ping desatualizado. usuarioId=%s, token=%s", usuarioId, token);
+      return;
+    }
+
+    // 7. Ping em intervalo irregular 
+    if (lastPing && typeof lastPing.last_millis === "number" && typeof lastPing.current_millis === "number") {
+      const diff = lastPing.current_millis - lastPing.last_millis;
+      Logger.log(">>> DEBUG auditoria: usuarioId=%s, token=%s, last_millis=%s, current_millis=%s, diff=%s", 
+          lastPing.usuarioId, lastPing.token, lastPing.last_millis, lastPing.current_millis, diff);
+      if (diff < SESSION_RULES.PING_INTERVAL_MIN_MILLIS || diff > SESSION_RULES.PING_INTERVAL_MAX_MILLIS) {
+        Logger.log(">>> VAI CRIAR LOGOUT DETALHADO!");
+        criarLogout({
+          usuarioId: lastPing.usuarioId,
+          token: lastPing.token,
+          origin: lastPing.origin,
+          reason: "ping_intervalo_irregular_de_" + (diff/1000) + "s",
+          current_sessionId: lastPing.sessionId,
+          current_fingerprint: lastPing.fingerprint,
+          initial_millis: lastPing.start_millis,
+          previous_millis: lastPing.last_millis,
+          current_millis: lastPing.current_millis,
+          final_millis: agora,
+          elapsed_millis: lastPing.current_millis - lastPing.start_millis,
+          min_allowed_ping: SESSION_RULES.PING_INTERVAL_MIN_MILLIS,
+          max_allowed_ping: SESSION_RULES.PING_INTERVAL_MAX_MILLIS,
+          others: { difference_millis: diff }
+        });
+        Logger.log("auditoriaAtiva: Expirou por ping irregular. usuarioId=%s, token=%s", lastPing.usuarioId, lastPing.token);
+        return;
+      }
+    }
+    // Se chegou aqui, sessão está válida.
+  });
+
+  Logger.log("auditoriaAtiva: FINALIZADO!");
+}
+
+// Função para logout manual
+function sairLogout(usuarioId, token, origin, sessionId, fingerprint) {
+  const lastPing = getLastPing(usuarioId, token) || {};
+  criarLogout({
+    usuarioId,
+    token,
+    origin: origin || (lastPing.origin || "desconhecido"),
+    reason: "logout_usuario",
+    current_sessionId: sessionId || (lastPing.sessionId || null),
+    current_fingerprint: fingerprint || (lastPing.fingerprint || null),
+    initial_millis: lastPing.start_millis || null,
+    previous_millis: lastPing.last_millis || null,
+    current_millis: lastPing.current_millis || null,
+    final_millis: Date.now(),
+    elapsed_millis: lastPing.start_millis ? (Date.now() - lastPing.start_millis) : null
+  });
+  return { success: true };
+}
+
+// ===== REGISTRO DE PING FINAL: CHAME SÓ ESTA! =====
+
+function registrarPing(usuarioId, token, origin, sessionId, fingerprint) {
+  return auditoriaReativa(usuarioId, token, origin, sessionId, fingerprint);
+}
+
+// ====== BLOCO C: SESSÃO / FRONTEND HANDLER =================================================
+
+function doGet(e) {
+  const page = e.parameter.page;
+
+  // 1. Permite validar.html apenas via link do email
+  if (page === "validar") {
+    var recToken = e.parameter.token;
+    if (recToken) {
+      const tpl = HtmlService.createTemplateFromFile('validar');
+      tpl.baseUrl = ScriptApp.getService().getUrl();
+      tpl.token = recToken;
+      return tpl.evaluate().setTitle('Validação de Conta');
+    } else {
+      const tplL = HtmlService.createTemplateFromFile('login');
+      tplL.baseUrl = ScriptApp.getService().getUrl();
+      return tplL.evaluate().setTitle('Login');
+    }
+  }
+
+  // 2. Recuperação de senha — só via link do email
+  if (page === "recuperar") {
+    var recToken = e.parameter.token;
+    if (recToken) {
+      const tpl = HtmlService.createTemplateFromFile('recuperar');
+      tpl.baseUrl = ScriptApp.getService().getUrl();
+      tpl.token = recToken;
+      return tpl.evaluate().setTitle('Redefinir Senha');
+    } else {
+      const tplL = HtmlService.createTemplateFromFile('login');
+      tplL.baseUrl = ScriptApp.getService().getUrl();
+      return tplL.evaluate().setTitle('Login');
+    }
+  }
+
+  // 2. Usuário autenticado via token
+  const token = e.parameter.token;
+  let sess = null;
+  let tokenValido = false;
+  try {
+    sess = getSessionData(token);
+    if (sess && sess.usuarioId && sess.token) {
+      validarToken(sess.usuarioId, sess.token); // lança erro se for inválido/expirado/formato errado
+      tokenValido = true;
+    }
+  } catch (err) {
+    tokenValido = false;
+  }
+
+  if (tokenValido) {
+    const page = e.parameter.page || 'menu';
+    const allowed = [
+      'menu',
+      'filtro_questoes',
+      'questoes',
+      'filtro_simulado',
+      'simulado',
+      'filtro_revisao',
+      'revisao',
+      'resumos',
+      'monitor_frontend',
+      'teste_informacoes'
+    ];
+    const file = allowed.includes(page) ? page : 'menu';
+    const tpl = HtmlService.createTemplateFromFile(file);
+    tpl.baseUrl = ScriptApp.getService().getUrl();
+    tpl.usuarioId = sess.usuarioId;
+    tpl.usuarioNome = sess.usuarioNome;
+    tpl.token = token;
+    tpl.pageName = file;
+    return tpl.evaluate().setTitle(file);
+  }
+
+  // 3. Termos de uso público
+  if (page === "termos") {
+    const tplC = HtmlService.createTemplateFromFile('termos');
+    tplC.baseUrl = ScriptApp.getService().getUrl();
+    return tplC.evaluate().setTitle('Termos de uso');
+  }
+
+  // 4. Fallback: mostra login
+  const tplL = HtmlService.createTemplateFromFile('login');
+  tplL.baseUrl = ScriptApp.getService().getUrl();
+  return tplL.evaluate().setTitle('Login');
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+
